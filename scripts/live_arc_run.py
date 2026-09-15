@@ -42,6 +42,8 @@ import sys
 import time
 from collections import deque
 
+import tiktoken
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from benchmarks.arc_challenge import (  # noqa: E402
@@ -54,12 +56,31 @@ from controller import EvolutionController  # noqa: E402
 from core.groq_client import GroqLLMClient  # noqa: E402
 
 
-CHARS_PER_TOKEN = 3.5  # conservative for digit-heavy ARC grids ("8 6 0 ..." tokenises ~1 token / 2 chars)
+CHARS_PER_TOKEN = 3.5  # fallback only, if the tokenizer cannot be loaded (first use downloads it)
+PER_MESSAGE_OVERHEAD = 4  # harmony role/start/end tokens per chat message, plus a few for the reply header
+_encoder = None
+
+
+def _get_encoder():
+    """gpt-oss uses the o200k_harmony tokenizer, shipped with tiktoken>=0.12."""
+    global _encoder
+    if _encoder is None:
+        try:
+            _encoder = tiktoken.get_encoding("o200k_harmony")
+        except Exception as e:  # no network for the first download, or old tiktoken
+            print(f"   [rate limit] tiktoken o200k_harmony unavailable ({e}); using {CHARS_PER_TOKEN} chars/token", flush=True)
+            _encoder = False
+    return _encoder or None
 
 
 def estimate_tokens(system_prompt: str, user_prompt: str, max_tokens: int) -> int:
     """Groq counts prompt + max_tokens against TPM when admitting a request, so budget both."""
-    return int((len(system_prompt) + len(user_prompt)) / CHARS_PER_TOKEN) + max_tokens
+    enc = _get_encoder()
+    if enc is None:
+        prompt = int((len(system_prompt) + len(user_prompt)) / CHARS_PER_TOKEN)
+    else:
+        prompt = len(enc.encode(system_prompt)) + len(enc.encode(user_prompt)) + 2 * PER_MESSAGE_OVERHEAD + 3
+    return prompt + max_tokens
 
 
 class RateLimiter:
