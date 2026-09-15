@@ -6,3 +6,6 @@ __pycache__/
 
 # run artifacts, rewritten on every generation / experiment run
 *_results.csv
+
+# full ARC-AGI Kaggle download (ARC_DATA_ROOT); the 4-task sample stays in benchmarks/arc_challenge/data
+data/
