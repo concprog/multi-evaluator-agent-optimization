@@ -30,6 +30,8 @@ class EvolutionController:
         inter_call_delay: float = 1.5,
         is_mock: Optional[bool] = None,
         evaluator_pool_factory: Optional[Callable[[GroqLLMClient], EvaluatorPool]] = None,
+        reasoning_effort: Optional[str] = None,
+        min_max_tokens: int = 0,
     ):
         self.api_key = api_key
         self.model = model
@@ -47,6 +49,8 @@ class EvolutionController:
             model=model,
             inter_call_delay=inter_call_delay,
             is_mock=is_mock,
+            reasoning_effort=reasoning_effort,
+            min_max_tokens=min_max_tokens,
         )
         # Default: the 6 canonical mu evaluators. A factory swaps in a benchmark-specific suite
         # (e.g. benchmarks.arc_challenge.build_arc_evaluator_pool).

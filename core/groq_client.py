@@ -63,7 +63,15 @@ class GroqLLMClient:
         model: str = "openai/gpt-oss-120b",
         inter_call_delay: float = 1.5,
         is_mock: Optional[bool] = None,
+        reasoning_effort: Optional[str] = None,
+        min_max_tokens: int = 0,
     ):
+        # reasoning_effort ("low" | "medium" | "high") is sent for openai/gpt-oss-* only. Those models spend
+        # max_tokens on hidden reasoning first: at the default effort a 1024-token budget is routinely used up
+        # with EMPTY content (ARC prompts: ~1020 reasoning tokens, finish_reason="length"). "low" plus a
+        # bigger floor (`min_max_tokens`, applied on top of the per-agent knob) gets a full answer in one call.
+        self.reasoning_effort = reasoning_effort
+        self.min_max_tokens = min_max_tokens
         if is_mock is not None:
             self.is_mock = is_mock
             self.api_key = api_key or ""
@@ -99,6 +107,7 @@ class GroqLLMClient:
 
         candidate_models = [self.model] + [m for m in FALLBACK_MODELS if m != self.model]
         last_error = None
+        max_tokens = max(max_tokens, self.min_max_tokens)
         budget = max_tokens
         budget_raised = False
         too_large = False
@@ -112,6 +121,9 @@ class GroqLLMClient:
                     if self.inter_call_delay > 0:
                         time.sleep(self.inter_call_delay)
 
+                    extra = {}
+                    if self.reasoning_effort:
+                        extra["reasoning_effort"] = self.reasoning_effort
                     response = self.client.chat.completions.create(
                         model=model_name,
                         messages=[
@@ -121,6 +133,7 @@ class GroqLLMClient:
                         temperature=max(0.0, min(2.0, temperature)),
                         top_p=max(0.0, min(1.0, top_p)),
                         max_tokens=budget,
+                        **extra,
                     )
                     choice = response.choices[0]
                     content = choice.message.content or ""
@@ -139,6 +152,12 @@ class GroqLLMClient:
                 except Exception as e:
                     err_str = str(e).lower()
                     last_error = e
+                    # Model rejects the reasoning_effort value (gpt-oss: low|medium|high; qwen also "none"):
+                    # drop it for the rest of this process rather than retrying the same 400.
+                    if "reasoning_effort" in err_str and self.reasoning_effort:
+                        logger.warning(f"{model_name} rejected reasoning_effort={self.reasoning_effort!r}; sending without it. {e}")
+                        self.reasoning_effort = None
+                        continue
                     # 413: the single request exceeds the org's TPM limit. No wait or fallback model
                     # (same org limit) can fix that, so fail fast instead of burning 6 backoffs.
                     if "413" in err_str or "request too large" in err_str or "reduce your message size" in err_str:

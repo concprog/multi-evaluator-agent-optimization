@@ -8,13 +8,17 @@ agent's program for every task.
     uv run python scripts/live_arc_run.py                 # 10 generations, openai/gpt-oss-120b, 30 RPM / 8k TPM
     uv run python scripts/live_arc_run.py --generations 5 --strategy no_pruning --tpm 30000 --model openai/gpt-oss-20b
 
-Rate limiting: `--rpm` and `--tpm` are sliding-window caps on calls and on tokens (prompt estimate +
-max_tokens) per minute; every call - agent, mutator, LLM judge - goes through them. On ARC the token cap
-is the one that binds: a 30x30 grid task prompt is several thousand tokens, and Groq's free tier allows
-8000 TPM on gpt-oss-120b, so most of the wall time is the limiter waiting for the window to roll. Set
---tpm to your account's limit (console.groq.com/settings/limits). `--delay` is a floor between calls.
-If Groq still 429s, GroqLLMClient now sleeps for the exact "try again in Ns" it reports rather than a
-fixed 3.5/7/10.5 s; the pool falls back to openai/gpt-oss-20b only if the model 404s.
+Rate limiting: `--rpm` and `--tpm` are sliding-window caps on calls and on tokens (prompt, counted with
+the gpt-oss tokenizer, + Groq's fixed ~500-token reply estimate) per minute; every call - agent, mutator,
+LLM judge - goes through them. Set --tpm to your account's limit (console.groq.com/settings/limits;
+on-demand tier: 8000 TPM and a 200k tokens/DAY cap on gpt-oss-120b, which is the real ceiling - a full
+120-task generation is ~2 days of quota). `--delay` is a floor between calls. If Groq still 429s,
+GroqLLMClient sleeps for the exact "try again in Ns" it reports; a 413 (single request over TPM) fails fast.
+
+Reasoning models: `--reasoning-effort low` (default) and `--max-tokens 3000` are what make gpt-oss answer
+at all - at default effort it burns a 1024-token budget on hidden reasoning and returns empty content.
+qwen/qwen3.8-27b also accepts `--reasoning-effort none`, but its on-demand tier caps output at 1000
+tokens/min so it truncates mid-answer on ARC prompts; not usable there without a paid tier.
 
 Reads GROQ_API_KEY from .env (falls back to the deterministic mock if unset). Two CSVs are
 written (both git-ignored via *_results.csv), rewritten after every generation:
@@ -73,14 +77,20 @@ def _get_encoder():
     return _encoder or None
 
 
-def estimate_tokens(system_prompt: str, user_prompt: str, max_tokens: int) -> int:
-    """Groq counts prompt + max_tokens against TPM when admitting a request, so budget both."""
+ADMISSION_COMPLETION_ESTIMATE = 500  # what Groq adds for the reply when admitting against TPM (seen: +430..470)
+
+
+def estimate_tokens(system_prompt: str, user_prompt: str) -> int:
+    """Tokens Groq charges against TPM at admission: prompt + a fixed reply estimate, NOT max_tokens.
+
+    ("Requested 1194" for a 727-token prompt with max_tokens=2048; "Requested 9841" for ~9400 with 1024.)
+    """
     enc = _get_encoder()
     if enc is None:
         prompt = int((len(system_prompt) + len(user_prompt)) / CHARS_PER_TOKEN)
     else:
         prompt = len(enc.encode(system_prompt)) + len(enc.encode(user_prompt)) + 2 * PER_MESSAGE_OVERHEAD + 3
-    return prompt + max_tokens
+    return prompt + ADMISSION_COMPLETION_ESTIMATE
 
 
 class RateLimiter:
@@ -124,7 +134,7 @@ def install_rate_limiter(rpm: int, tpm: int) -> None:
 
     def gated(self, system_prompt, user_prompt, *args, **kwargs):
         if not self.is_mock:
-            limiter.wait(estimate_tokens(system_prompt, user_prompt, kwargs.get("max_tokens", 1024)))
+            limiter.wait(estimate_tokens(system_prompt, user_prompt))
         return original(self, system_prompt, user_prompt, *args, **kwargs)
 
     GroqLLMClient.generate = gated
@@ -171,6 +181,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--generations", type=int, default=10)
     parser.add_argument("--model", default="openai/gpt-oss-120b", help="Groq model id")
+    parser.add_argument("--reasoning-effort", default="low",
+                        help="gpt-oss: low|medium|high; qwen also accepts none. '' = don't send. At the default "
+                             "effort gpt-oss-120b spends ~1020 tokens of hidden reasoning on an ARC prompt and "
+                             "returns EMPTY content within a 1024 budget")
+    parser.add_argument("--max-tokens", type=int, default=3000,
+                        help="floor on max_tokens for every call (agent knobs default to 1024). Does not count "
+                             "against TPM admission, but qwen's on-demand tier caps output at 1000/min")
     parser.add_argument("--rpm", type=int, default=30, help="max LLM calls per rolling minute (0 = no cap)")
     parser.add_argument("--tpm", type=int, default=8000,
                         help="max tokens (prompt estimate + max_tokens) requested per rolling minute; "
@@ -205,12 +222,15 @@ def main() -> None:
         default_strategy=args.strategy,
         initial_archetype=args.archetype,
         lambda_penalty=args.lambda_penalty,
+        reasoning_effort=args.reasoning_effort or None,
+        min_max_tokens=args.max_tokens,
     )
     ctrl.csv_filepath = args.csv
     # The seed (gen 0) always runs every evaluator, so setting these after construction loses nothing.
     ctrl.sampler.deep_tier_threshold = args.deep_threshold
     ctrl.sampler.exploration_prob = args.explore_prob
     print("mock mode:", ctrl.llm_client.is_mock, "| model:", ctrl.llm_client.model,
+          f"| reasoning_effort: {args.reasoning_effort or 'default'} | max_tokens>={args.max_tokens}",
           f"| rpm cap: {args.rpm or 'none'} | tpm cap: {args.tpm or 'none'} | delay: {args.delay}s",
           f"| strategy: {args.strategy} deep_threshold={args.deep_threshold} explore={args.explore_prob} "
           f"lambda={args.lambda_penalty}",
