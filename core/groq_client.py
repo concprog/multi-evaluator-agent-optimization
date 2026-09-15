@@ -101,8 +101,11 @@ class GroqLLMClient:
         last_error = None
         budget = max_tokens
         budget_raised = False
+        too_large = False
 
         for model_name in candidate_models:
+            if too_large:
+                break
             # Attempt up to 3 retries with exponential backoff on TPM rate limits
             for attempt in range(3):
                 try:
@@ -136,6 +139,12 @@ class GroqLLMClient:
                 except Exception as e:
                     err_str = str(e).lower()
                     last_error = e
+                    # 413: the single request exceeds the org's TPM limit. No wait or fallback model
+                    # (same org limit) can fix that, so fail fast instead of burning 6 backoffs.
+                    if "413" in err_str or "request too large" in err_str or "reduce your message size" in err_str:
+                        logger.error(f"Request too large for the TPM limit on {model_name}; not retrying. {e}")
+                        too_large = True
+                        break
                     # Check for rate limit / TPM / RPM error
                     if "429" in err_str or "rate limit" in err_str or "tokens per minute" in err_str:
                         # Groq says how long the window needs ("Please try again in 12.3s" / retry-after
