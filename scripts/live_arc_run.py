@@ -18,6 +18,16 @@ written (both git-ignored via *_results.csv), rewritten after every generation:
     --csv       live_arc_results.csv       archive export, one row per candidate (averaged metrics)
     --task-csv  live_arc_task_results.csv  one row per (generation, task): every metric + solved flag
 
+`arc_pass_at_2_test` is a deep-tier evaluator, so full_adaptive / static_cascade skip it for candidates
+whose core preview is weak. Scoring the held-out pairs is pure Python (no LLM call; its $0.005 is a nominal
+cost for the pruning model), so by default the script also scores every task out-of-band and writes it as
+`arc_pass_at_2_test_reported` / `solved` - the true ARC score for every row, without touching the
+strategy's fitness, pruning or cost accounting. Disable with --no-report-test.
+
+To keep the held-out score IN the loop under full_adaptive (GP weights, no pruning of the deep tier):
+
+    uv run python scripts/live_arc_run.py --strategy full_adaptive --deep-threshold 0.0
+
 Point the loader at a full Kaggle download with env vars set before Python starts:
 
     ARC_DATA_ROOT=/path/arc-prize-2025 ARC_TASK_FILE=evaluation ARC_TASK_LIMIT=20 \
@@ -35,7 +45,12 @@ from collections import deque
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from benchmarks.arc_challenge import ARC_BENCHMARK_ID, build_arc_evaluator_pool  # noqa: E402
+from benchmarks.arc_challenge import (  # noqa: E402
+    ARC_BENCHMARK_ID,
+    build_arc_evaluator_pool,
+    get_arc_task,
+    score_arc_cases,
+)
 from controller import EvolutionController  # noqa: E402
 from core.groq_client import GroqLLMClient  # noqa: E402
 
@@ -76,18 +91,40 @@ def install_rate_limiter(rpm: int) -> None:
     GroqLLMClient.generate = gated
 
 
-def write_task_csv(path: str, records: list, metric_names: list) -> None:
+def report_held_out(ctrl: EvolutionController, record: dict) -> dict:
+    """Official held-out pass@2 per task for the record's agent, computed outside the evaluator loop."""
+    agent = ctrl.archive.agents[record["child_id"]]
+    out = {}
+    for tid, program in agent.task_solutions.items():
+        task = get_arc_task(tid)
+        if task is None:
+            continue
+        m = score_arc_cases(task.edge_cases, program, task.entry_point, prefix="test_example")
+        out[tid] = round(float(m["combined_score"]), 4)
+    record["held_out_reported"] = out
+    return out
+
+
+def write_task_csv(path: str, records: list, metric_names: list, report_test: bool) -> None:
     """One row per (generation, task). Metrics pruned by the selective search are left blank."""
-    fields = ["generation", "child_id", "mutation_type", "task_id", *metric_names, "solved"]
+    fields = ["generation", "child_id", "mutation_type", "task_id", *metric_names]
+    if report_test:
+        fields.append("arc_pass_at_2_test_reported")
+    fields.append("solved")
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         for r in records:
+            reported = r.get("held_out_reported", {})
             for tid, m in r["task_metrics"].items():
                 row = {"generation": r["generation"], "child_id": r["child_id"],
                        "mutation_type": r["mutation_type"], "task_id": tid}
                 row.update({k: m[k] for k in metric_names if k in m})
-                row["solved"] = int(m.get("arc_pass_at_2_test", 0.0) >= 1.0) if "arc_pass_at_2_test" in m else ""
+                # solved uses the out-of-band score when available, else the in-loop one (blank if pruned)
+                score = reported.get(tid, m.get("arc_pass_at_2_test"))
+                if report_test:
+                    row["arc_pass_at_2_test_reported"] = reported.get(tid, "")
+                row["solved"] = int(score >= 1.0) if score is not None else ""
                 w.writerow(row)
 
 
@@ -100,9 +137,18 @@ def main() -> None:
                         choices=["full_adaptive", "no_pruning", "ucb1_bandit", "static_cascade", "single_metric"])
     parser.add_argument("--delay", type=float, default=1.5, help="minimum seconds between consecutive LLM calls")
     parser.add_argument("--archetype", default="General Balanced Assistant")
+    parser.add_argument("--deep-threshold", type=float, default=0.65,
+                        help="full_adaptive/static_cascade: core-preview score needed to run the deep tier "
+                             "(arc_pass_at_2_test, arc_color_palette); 0.0 = always run it")
+    parser.add_argument("--explore-prob", type=float, default=0.30,
+                        help="full_adaptive/static_cascade: chance to run the deep tier anyway")
+    parser.add_argument("--lambda-penalty", type=float, default=0.5,
+                        help="lambda in fitness = sum(w*mu) - lambda*sum(cost)")
     parser.add_argument("--csv", default="live_arc_results.csv", help="archive export (one row per candidate)")
     parser.add_argument("--task-csv", default="live_arc_task_results.csv",
                         help="per-task metrics, one row per (generation, task)")
+    parser.add_argument("--no-report-test", dest="report_test", action="store_false",
+                        help="do not score held-out pairs out-of-band every generation")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
@@ -116,14 +162,22 @@ def main() -> None:
         inter_call_delay=args.delay,
         default_strategy=args.strategy,
         initial_archetype=args.archetype,
+        lambda_penalty=args.lambda_penalty,
     )
     ctrl.csv_filepath = args.csv
+    # The seed (gen 0) always runs every evaluator, so setting these after construction loses nothing.
+    ctrl.sampler.deep_tier_threshold = args.deep_threshold
+    ctrl.sampler.exploration_prob = args.explore_prob
     print("mock mode:", ctrl.llm_client.is_mock, "| model:", ctrl.llm_client.model,
           f"| rpm cap: {args.rpm or 'none'} | delay: {args.delay}s",
+          f"| strategy: {args.strategy} deep_threshold={args.deep_threshold} explore={args.explore_prob} "
+          f"lambda={args.lambda_penalty}",
           "| tasks:", len(ctrl.history_records[0]["task_metrics"]), flush=True)
-    write_task_csv(args.task_csv, ctrl.history_records, ctrl.metric_names)
 
     seed = ctrl.history_records[0]
+    if args.report_test:
+        report_held_out(ctrl, seed)
+    write_task_csv(args.task_csv, ctrl.history_records, ctrl.metric_names, args.report_test)
     print(f"gen 0 seed  fitness={seed['fitness']:.4f} metrics={seed['metrics']}", flush=True)
     print("   per task pass@2 test:", {k: v.get("arc_pass_at_2_test") for k, v in seed["task_metrics"].items()}, flush=True)
 
@@ -135,7 +189,11 @@ def main() -> None:
             flush=True,
         )
         print("   per task pass@2 train:", {k: v.get("arc_pass_at_2_train") for k, v in r["task_metrics"].items()}, flush=True)
-        write_task_csv(args.task_csv, ctrl.history_records, ctrl.metric_names)
+        if args.report_test:
+            rep = report_held_out(ctrl, r)
+            solved = sum(1 for v in rep.values() if v >= 1.0)
+            print(f"   held-out (reported): {solved}/{len(rep)} solved = {solved / max(1, len(rep)):.4f}", flush=True)
+        write_task_csv(args.task_csv, ctrl.history_records, ctrl.metric_names, args.report_test)
 
     best = ctrl.archive.get_best_agent()
     print("\nBEST:", best.id, f"fitness={best.fitness:.4f}", best.metrics, flush=True)
