@@ -44,6 +44,7 @@ import logging
 import os
 import sys
 import time
+import traceback
 from collections import deque
 
 import tiktoken
@@ -243,26 +244,63 @@ def main() -> None:
     print(f"gen 0 seed  fitness={seed['fitness']:.4f} metrics={seed['metrics']}", flush=True)
     print("   per task pass@2 test:", {k: v.get("arc_pass_at_2_test") for k, v in seed["task_metrics"].items()}, flush=True)
 
-    for _ in range(args.generations):
-        r = ctrl.run_generation()
-        print(
-            f"gen {r['generation']} {r['mutation_type']:<22} active={len(r['active_evaluators'])} "
-            f"fitness={r['fitness']:.4f} dF={r['delta_f']:+.4f} cost=${r['cost_spent']:.4f} metrics={r['metrics']}",
-            flush=True,
-        )
-        print("   per task pass@2 train:", {k: v.get("arc_pass_at_2_train") for k, v in r["task_metrics"].items()}, flush=True)
-        if args.report_test:
-            rep = report_held_out(ctrl, r)
-            solved = sum(1 for v in rep.values() if v >= 1.0)
-            print(f"   held-out (reported): {solved}/{len(rep)} solved = {solved / max(1, len(rep)):.4f}", flush=True)
-        write_task_csv(args.task_csv, ctrl.history_records, ctrl.metric_names, args.report_test)
+    if quota_exhausted(ctrl):
+        print("stopping: daily quota already exhausted during the seed generation", flush=True)
+        return finish(ctrl, args, exit_code=2)
 
+    exit_code = 0
+    try:
+        for _ in range(args.generations):
+            r = ctrl.run_generation()
+            print(
+                f"gen {r['generation']} {r['mutation_type']:<22} active={len(r['active_evaluators'])} "
+                f"fitness={r['fitness']:.4f} dF={r['delta_f']:+.4f} cost=${r['cost_spent']:.4f} metrics={r['metrics']}",
+                flush=True,
+            )
+            print("   per task pass@2 train:", {k: v.get("arc_pass_at_2_train") for k, v in r["task_metrics"].items()}, flush=True)
+            if args.report_test:
+                rep = report_held_out(ctrl, r)
+                solved = sum(1 for v in rep.values() if v >= 1.0)
+                print(f"   held-out (reported): {solved}/{len(rep)} solved = {solved / max(1, len(rep)):.4f}", flush=True)
+            write_task_csv(args.task_csv, ctrl.history_records, ctrl.metric_names, args.report_test)
+            if ctrl.llm_client.failed_calls:
+                print(f"   failed live calls so far: {ctrl.llm_client.failed_calls} (each scored as an empty answer)", flush=True)
+            if quota_exhausted(ctrl):
+                # Everything from here would be empty answers scored 0; stop with the CSVs as they stand.
+                print(f"stopping: daily quota exhausted - {ctrl.llm_client.quota_exhausted_error}", flush=True)
+                exit_code = 2
+                break
+    except KeyboardInterrupt:
+        print("\ninterrupted - flushing CSVs for the generations that completed", flush=True)
+        exit_code = 130
+    except Exception as e:  # noqa: BLE001 - keep whatever finished; the traceback follows the summary
+        print(f"\nrun aborted by {type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+        exit_code = 1
+    return finish(ctrl, args, exit_code)
+
+
+def quota_exhausted(ctrl: EvolutionController) -> bool:
+    until = ctrl.llm_client.quota_exhausted_until
+    return until is not None and time.time() < until
+
+
+def finish(ctrl: EvolutionController, args, exit_code: int) -> None:
+    """Writes both CSVs from whatever completed and prints the best agent, then exits with `exit_code`."""
+    try:
+        ctrl.archive.export_to_csv(args.csv)
+        write_task_csv(args.task_csv, ctrl.history_records, ctrl.metric_names, args.report_test)
+    except Exception as e:  # noqa: BLE001
+        print(f"could not write CSVs: {e}", flush=True)
     best = ctrl.archive.get_best_agent()
-    print("\nBEST:", best.id, f"fitness={best.fitness:.4f}", best.metrics, flush=True)
-    print("telemetry:", json.dumps(ctrl.get_telemetry_summary(), indent=1, default=str), flush=True)
-    print(f"\ncsv: {args.csv}  task csv: {args.task_csv}", flush=True)
-    for tid, sol in best.task_solutions.items():
-        print(f"\n----- {tid} -----\n{sol[:700]}", flush=True)
+    if best is not None:
+        print("\nBEST:", best.id, f"fitness={best.fitness:.4f}", best.metrics, flush=True)
+        print("telemetry:", json.dumps(ctrl.get_telemetry_summary(), indent=1, default=str), flush=True)
+    print(f"\ncsv: {args.csv}  task csv: {args.task_csv}  generations completed: {len(ctrl.history_records) - 1}", flush=True)
+    if best is not None:
+        for tid, sol in best.task_solutions.items():
+            print(f"\n----- {tid} -----\n{sol[:700]}", flush=True)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

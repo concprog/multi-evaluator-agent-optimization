@@ -83,6 +83,8 @@ class GroqLLMClient:
         self.inter_call_delay = inter_call_delay
         self.client = None
         self.failed_calls = 0  # live calls that exhausted every model and returned ""
+        self.quota_exhausted_until: Optional[float] = None  # epoch seconds, set on a daily (TPD/RPD) 429
+        self.quota_exhausted_error: Optional[str] = None
 
         if not self.is_mock and GROQ_AVAILABLE and self.api_key and self.api_key.strip():
             try:
@@ -104,6 +106,13 @@ class GroqLLMClient:
         """Generates response using Groq API with automatic TPM rate-limit retry backoff and fallbacks."""
         if self.is_mock or not self.client:
             return self._mock_generate(system_prompt, user_prompt, temperature)
+
+        if self.quota_exhausted_until is not None:
+            if time.time() < self.quota_exhausted_until:
+                self.failed_calls += 1
+                return ""  # daily quota known to be gone; don't spend a round-trip on a certain 429
+            self.quota_exhausted_until = None
+            self.quota_exhausted_error = None
 
         candidate_models = [self.model] + [m for m in FALLBACK_MODELS if m != self.model]
         last_error = None
@@ -163,6 +172,15 @@ class GroqLLMClient:
                     if "413" in err_str or "request too large" in err_str or "reduce your message size" in err_str:
                         logger.error(f"Request too large for the TPM limit on {model_name}; not retrying. {e}")
                         too_large = True
+                        break
+                    # Daily quota (TPD / RPD) gone: the window is minutes-to-hours away, so no in-call backoff
+                    # helps. Record it and fail fast; a runner can check `quota_exhausted_until` and stop cleanly.
+                    if "per day" in err_str and ("429" in err_str or "rate limit" in err_str):
+                        wait = retry_after_seconds(e, max_wait=24 * 3600.0) or 3600.0
+                        self.quota_exhausted_until = time.time() + wait
+                        self.quota_exhausted_error = str(e)
+                        logger.error(f"Daily quota exhausted on {model_name} (retry in ~{wait / 60:.0f} min); not retrying. {e}")
+                        too_large = True  # same effect: skip the remaining candidates
                         break
                     # Check for rate limit / TPM / RPM error
                     if "429" in err_str or "rate limit" in err_str or "tokens per minute" in err_str:
