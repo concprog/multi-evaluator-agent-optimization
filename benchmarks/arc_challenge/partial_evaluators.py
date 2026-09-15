@@ -110,7 +110,7 @@ class ArcColorPaletteEvaluator(_PartialArcEvaluator):
     heuristic = staticmethod(_palette_similarity)
 
     def __init__(self):
-        super().__init__(name="arc_color_palette", cost=0.002, tier="deep")
+        super().__init__(name="arc_color_palette", cost=0.000, tier="core")
 
 
 PARTIAL_ARC_EVALUATORS = (ArcPixelAccuracyEvaluator, ArcShapeMatchEvaluator, ArcColorPaletteEvaluator)

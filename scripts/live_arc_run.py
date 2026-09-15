@@ -18,15 +18,10 @@ written (both git-ignored via *_results.csv), rewritten after every generation:
     --csv       live_arc_results.csv       archive export, one row per candidate (averaged metrics)
     --task-csv  live_arc_task_results.csv  one row per (generation, task): every metric + solved flag
 
-`arc_pass_at_2_test` is a deep-tier evaluator, so full_adaptive / static_cascade skip it for candidates
-whose core preview is weak. Scoring the held-out pairs is pure Python (no LLM call; its $0.005 is a nominal
-cost for the pruning model), so by default the script also scores every task out-of-band and writes it as
-`arc_pass_at_2_test_reported` / `solved` - the true ARC score for every row, without touching the
-strategy's fitness, pruning or cost accounting. Disable with --no-report-test.
-
-To keep the held-out score IN the loop under full_adaptive (GP weights, no pruning of the deep tier):
-
-    uv run python scripts/live_arc_run.py --strategy full_adaptive --deep-threshold 0.0
+The ARC pool is flat (every evaluator core tier, $0 cost - none of them calls an LLM), so no strategy
+prunes `arc_pass_at_2_test` and it is present on every row. `arc_pass_at_2_test_reported` is the same
+score recomputed out-of-band as a cross-check (disable with --no-report-test); --deep-threshold /
+--explore-prob only matter if LLM judges are added to the pool.
 
 Point the loader at a full Kaggle download with env vars set before Python starts:
 

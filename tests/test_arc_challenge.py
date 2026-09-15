@@ -228,8 +228,10 @@ class TestArcChallengeBenchmark(unittest.TestCase):
             ["arc_runs_successfully", "arc_pass_at_2_train", "arc_pass_at_2_test",
              "arc_pixel_accuracy", "arc_shape_match", "arc_color_palette"],
         )
-        self.assertEqual(len(pool.get_evaluators_by_tier("core")), 4)
-        self.assertEqual(len(pool.get_evaluators_by_tier("deep")), 2)
+        # Flat pool: nothing is pruned, so the official metric is present for every candidate.
+        self.assertEqual(len(pool.get_evaluators_by_tier("core")), 6)
+        self.assertEqual(pool.get_evaluators_by_tier("deep"), [])
+        self.assertEqual(pool.get_full_eval_cost(), 0.0)
         self.assertEqual(len(build_arc_evaluator_pool(self.llm_client, include_partial=False).evaluators), 3)
         self.assertEqual(len(build_arc_evaluator_pool(self.llm_client, include_llm_judges=True).evaluators), 8)
 
@@ -408,14 +410,9 @@ class TestArcVisualisation(unittest.TestCase):
         self.assertIn("Candidate to visualise", labels)
         self.assertIn("Task to draw", labels)  # per-task gallery picker for a whole-benchmark candidate
         shown = {m.label: (m.value, m.delta) for m in at.metric}
-        # The visualised candidate is the best-fitness ARC agent; adaptive pruning may have skipped the deep
-        # tier for it, in which case the KPI must say so rather than show a fake 0.00.
-        best = max((a for a in ctrl.archive.get_all_agents() if a.task_id == ARC_BENCHMARK_ID), key=lambda a: a.fitness)
-        if "arc_pass_at_2_test" in best.metrics:
-            self.assertEqual(shown["Pass@2 — held-out (official)"], ("1.00", f"{len(ARC_TASKS)} / {len(ARC_TASKS)} tasks solved"))
-        else:
-            self.assertEqual(shown["Pass@2 — held-out (official)"][0], "— (pruned)")
-        self.assertEqual(shown["Pass@2 — demonstrations"][0], "1.00")  # core tier always runs
+        # The ARC pool is flat (all core), so the official metric is never pruned for any candidate.
+        self.assertEqual(shown["Pass@2 — held-out (official)"], ("1.00", f"{len(ARC_TASKS)} / {len(ARC_TASKS)} tasks solved"))
+        self.assertEqual(shown["Pass@2 — demonstrations"][0], "1.00")
         self.assertEqual(at.error, [])
         self.assertEqual(at.warning, [])
 

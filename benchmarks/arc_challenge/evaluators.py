@@ -49,7 +49,7 @@ class ArcPassAt2Evaluator(BaseEvaluator):
     OpenEvolve's `combined_score` during evolution ($0.001)."""
 
     def __init__(self):
-        super().__init__(name="arc_pass_at_2_train", cost=0.001, tier="core")
+        super().__init__(name="arc_pass_at_2_train", cost=0.000, tier="core")
 
     def evaluate(
         self,
@@ -73,10 +73,10 @@ class ArcPassAt2Evaluator(BaseEvaluator):
 
 class ArcHeldOutPassAt2Evaluator(BaseEvaluator):
     """arc_pass_at_2_test: mean pass@2 over the held-out (test) pairs — the official ARC
-    task score / OpenEvolve's post-evolution evaluation ($0.005)."""
+    task score / OpenEvolve's post-evolution evaluation."""
 
     def __init__(self):
-        super().__init__(name="arc_pass_at_2_test", cost=0.005, tier="deep")
+        super().__init__(name="arc_pass_at_2_test", cost=0.000, tier="core")
 
     def evaluate(
         self,

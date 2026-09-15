@@ -17,8 +17,10 @@ def build_arc_evaluator_pool(
 ) -> EvaluatorPool:
     """Builds the ARC evaluator suite.
 
-    Core tier: arc_runs_successfully, arc_pass_at_2_train (+ arc_pixel_accuracy, arc_shape_match).
-    Deep tier: arc_pass_at_2_test (+ arc_color_palette; + mu_4/mu_6 LLM judges when requested).
+    The pool is flat: every ARC evaluator is core tier at $0 cost, since each just executes `solve()`
+    on grids (no LLM call) and there is nothing worth pruning - so every candidate is scored on the
+    official held-out metric every generation and fitness reduces to sum(w * mu). Only the optional
+    mu_4/mu_6 LLM judges are deep tier, because they do cost a call.
     Pass as `EvolutionController(evaluator_pool_factory=build_arc_evaluator_pool)`.
     """
     pool = EvaluatorPool(llm_client=llm_client, register_defaults=False)
