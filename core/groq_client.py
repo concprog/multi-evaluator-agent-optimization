@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 from typing import Optional, List
 from dotenv import load_dotenv
 load_dotenv()
@@ -24,6 +25,33 @@ FALLBACK_MODELS = [
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
 ]
+
+# "try again in 12.3s", "850ms", "1m2.5s"
+_RETRY_IN_RE = re.compile(r"try again in\s*((?:\d+(?:\.\d+)?(?:ms|s|m)\s*)+)", re.IGNORECASE)
+_DURATION_PART_RE = re.compile(r"(\d+(?:\.\d+)?)(ms|s|m)", re.IGNORECASE)
+_UNIT_SECONDS = {"ms": 0.001, "s": 1.0, "m": 60.0}
+
+
+def retry_after_seconds(error: Exception, max_wait: float = 120.0) -> Optional[float]:
+    """Seconds Groq asked us to wait on a 429, from the retry-after header or the message text.
+
+    Returns None if the error carries no hint. Capped at `max_wait`, plus a small margin so the
+    retry lands after the window has actually rolled over.
+    """
+    wait: Optional[float] = None
+    headers = getattr(getattr(error, "response", None), "headers", None)
+    if headers:
+        try:
+            wait = float(headers.get("retry-after", ""))
+        except (TypeError, ValueError):
+            wait = None
+    if wait is None:
+        m = _RETRY_IN_RE.search(str(error))
+        if m:
+            wait = sum(float(v) * _UNIT_SECONDS[u.lower()] for v, u in _DURATION_PART_RE.findall(m.group(1)))
+    if wait is None:
+        return None
+    return min(max_wait, wait + 0.5)
 
 
 class GroqLLMClient:
@@ -110,8 +138,10 @@ class GroqLLMClient:
                     last_error = e
                     # Check for rate limit / TPM / RPM error
                     if "429" in err_str or "rate limit" in err_str or "tokens per minute" in err_str:
-                        backoff = (attempt + 1) * 3.5
-                        logger.warning(f"Rate limit hit on {model_name} (attempt {attempt+1}/3). Backing off {backoff}s...")
+                        # Groq says how long the window needs ("Please try again in 12.3s" / retry-after
+                        # header); waiting less than that just burns an attempt on a guaranteed 429.
+                        backoff = retry_after_seconds(e) or (attempt + 1) * 3.5
+                        logger.warning(f"Rate limit hit on {model_name} (attempt {attempt+1}/3). Backing off {backoff:.1f}s...")
                         time.sleep(backoff)
                         continue
                     elif "404" in err_str or "model_not_found" in err_str or "decommissioned" in err_str:

@@ -5,12 +5,16 @@ selected, but prints everything so a run can be inspected: per-generation mutati
 evaluator subset, fitness, dF, cost, averaged metrics and per-task pass@2, then the best
 agent's program for every task.
 
-    uv run python scripts/live_arc_run.py                 # 10 generations, openai/gpt-oss-120b, 30 RPM
-    uv run python scripts/live_arc_run.py --generations 5 --strategy no_pruning --rpm 20 --model openai/gpt-oss-20b
+    uv run python scripts/live_arc_run.py                 # 10 generations, openai/gpt-oss-120b, 30 RPM / 8k TPM
+    uv run python scripts/live_arc_run.py --generations 5 --strategy no_pruning --tpm 30000 --model openai/gpt-oss-20b
 
-Rate limiting: `--rpm` is a hard sliding-window cap on LLM calls per minute (every call - agent, mutator,
-LLM judge - goes through it), `--delay` a floor between consecutive calls. Groq's own 429 backoff in
-GroqLLMClient still applies on top; the pool falls back to openai/gpt-oss-20b only if the model 404s.
+Rate limiting: `--rpm` and `--tpm` are sliding-window caps on calls and on tokens (prompt estimate +
+max_tokens) per minute; every call - agent, mutator, LLM judge - goes through them. On ARC the token cap
+is the one that binds: a 30x30 grid task prompt is several thousand tokens, and Groq's free tier allows
+8000 TPM on gpt-oss-120b, so most of the wall time is the limiter waiting for the window to roll. Set
+--tpm to your account's limit (console.groq.com/settings/limits). `--delay` is a floor between calls.
+If Groq still 429s, GroqLLMClient now sleeps for the exact "try again in Ns" it reports rather than a
+fixed 3.5/7/10.5 s; the pool falls back to openai/gpt-oss-20b only if the model 404s.
 
 Reads GROQ_API_KEY from .env (falls back to the deterministic mock if unset). Two CSVs are
 written (both git-ignored via *_results.csv), rewritten after every generation:
@@ -50,38 +54,57 @@ from controller import EvolutionController  # noqa: E402
 from core.groq_client import GroqLLMClient  # noqa: E402
 
 
+CHARS_PER_TOKEN = 3.5  # conservative for digit-heavy ARC grids ("8 6 0 ..." tokenises ~1 token / 2 chars)
+
+
+def estimate_tokens(system_prompt: str, user_prompt: str, max_tokens: int) -> int:
+    """Groq counts prompt + max_tokens against TPM when admitting a request, so budget both."""
+    return int((len(system_prompt) + len(user_prompt)) / CHARS_PER_TOKEN) + max_tokens
+
+
 class RateLimiter:
-    """Blocks so that at most `rpm` calls start within any rolling 60 s window."""
+    """Blocks so that no more than `rpm` calls start and `tpm` tokens are requested in any rolling 60 s."""
 
-    def __init__(self, rpm: int):
+    def __init__(self, rpm: int, tpm: int):
         self.rpm = rpm
-        self.starts: deque = deque()
+        self.tpm = tpm
+        self.log: deque = deque()  # (start_time, tokens)
 
-    def wait(self) -> None:
-        now = time.monotonic()
-        while self.starts and now - self.starts[0] >= 60.0:
-            self.starts.popleft()
-        if len(self.starts) >= self.rpm:
-            pause = 60.0 - (now - self.starts[0])
-            print(f"   [rate limit] {self.rpm} calls in the last minute, sleeping {pause:.1f}s", flush=True)
+    def _prune(self, now: float) -> None:
+        while self.log and now - self.log[0][0] >= 60.0:
+            self.log.popleft()
+
+    def wait(self, tokens: int) -> None:
+        while True:
+            now = time.monotonic()
+            self._prune(now)
+            used = sum(t for _, t in self.log)
+            over_rpm = self.rpm > 0 and len(self.log) >= self.rpm
+            over_tpm = self.tpm > 0 and self.log and used + tokens > self.tpm
+            if not (over_rpm or over_tpm):
+                break
+            pause = 60.0 - (now - self.log[0][0]) + 0.1
+            why = f"{len(self.log)} calls" if over_rpm else f"{used}+{tokens} tokens > {self.tpm} TPM"
+            print(f"   [rate limit] {why} in the last minute, sleeping {pause:.1f}s", flush=True)
             time.sleep(pause)
-            self.starts.popleft()
-        self.starts.append(time.monotonic())
+        if self.tpm > 0 and tokens > self.tpm:
+            print(f"   [rate limit] single call needs ~{tokens} tokens > {self.tpm} TPM; it will likely 429", flush=True)
+        self.log.append((time.monotonic(), tokens))
 
 
-def install_rate_limiter(rpm: int) -> None:
+def install_rate_limiter(rpm: int, tpm: int) -> None:
     """Gates every live GroqLLMClient.generate() in this process (agent, mutator and judge share one client).
 
     Patched on the class because the gen-0 seed is evaluated inside EvolutionController.__init__, before
     any instance is reachable. Mock calls are not throttled.
     """
-    limiter = RateLimiter(rpm)
+    limiter = RateLimiter(rpm, tpm)
     original = GroqLLMClient.generate
 
-    def gated(self, *args, **kwargs):
+    def gated(self, system_prompt, user_prompt, *args, **kwargs):
         if not self.is_mock:
-            limiter.wait()
-        return original(self, *args, **kwargs)
+            limiter.wait(estimate_tokens(system_prompt, user_prompt, kwargs.get("max_tokens", 1024)))
+        return original(self, system_prompt, user_prompt, *args, **kwargs)
 
     GroqLLMClient.generate = gated
 
@@ -128,6 +151,9 @@ def main() -> None:
     parser.add_argument("--generations", type=int, default=10)
     parser.add_argument("--model", default="openai/gpt-oss-120b", help="Groq model id")
     parser.add_argument("--rpm", type=int, default=30, help="max LLM calls per rolling minute (0 = no cap)")
+    parser.add_argument("--tpm", type=int, default=8000,
+                        help="max tokens (prompt estimate + max_tokens) requested per rolling minute; "
+                             "Groq free tier gpt-oss-120b is 8000 (0 = no cap)")
     parser.add_argument("--strategy", default="full_adaptive",
                         choices=["full_adaptive", "no_pruning", "ucb1_bandit", "static_cascade", "single_metric"])
     parser.add_argument("--delay", type=float, default=1.5, help="minimum seconds between consecutive LLM calls")
@@ -147,8 +173,8 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
-    if args.rpm > 0:
-        install_rate_limiter(args.rpm)
+    if args.rpm > 0 or args.tpm > 0:
+        install_rate_limiter(args.rpm, args.tpm)
 
     ctrl = EvolutionController(
         selected_task_id=ARC_BENCHMARK_ID,
@@ -164,7 +190,7 @@ def main() -> None:
     ctrl.sampler.deep_tier_threshold = args.deep_threshold
     ctrl.sampler.exploration_prob = args.explore_prob
     print("mock mode:", ctrl.llm_client.is_mock, "| model:", ctrl.llm_client.model,
-          f"| rpm cap: {args.rpm or 'none'} | delay: {args.delay}s",
+          f"| rpm cap: {args.rpm or 'none'} | tpm cap: {args.tpm or 'none'} | delay: {args.delay}s",
           f"| strategy: {args.strategy} deep_threshold={args.deep_threshold} explore={args.explore_prob} "
           f"lambda={args.lambda_penalty}",
           "| tasks:", len(ctrl.history_records[0]["task_metrics"]), flush=True)
